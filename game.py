@@ -13,7 +13,7 @@ class UnsafeSession(_orig_Session):
 requests.Session = UnsafeSession
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 import openai
 import random
 import os
@@ -35,14 +35,6 @@ def get_supabase():
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
-
-@st.cache_data(ttl=2)
-def fetch_leaderboard():
-    sb = get_supabase()
-    data = sb.table("leaderboard").select("player,score,updated_at").order("score", desc=True).limit(100).execute().data
-    if not data:
-        return pd.DataFrame(columns=["player","score","updated_at"])
-    return pd.DataFrame(data)
 
 def upsert_score(player, score):
     sb = get_supabase()
@@ -125,7 +117,7 @@ def generate_response(celebrity, user_prompt, difficulty):
     sys = (
         f'You are {celebrity}. Stay fully in character. '
         f'Be clear, friendly, and natural. Reference true works and collaborators. '
-        f'Never reveal or spell your name or initials. '
+        f'Never reveal or spell your name or initials unless asked to reveal after guesses are over. '
         f'Answer the user prompt and optionally offer a subtle hint. '
         f'Adjust hint density and mystery according to: {style}.'
     )
@@ -137,31 +129,63 @@ def generate_response(celebrity, user_prompt, difficulty):
     )
     return r.choices[0].message.content.strip()
 
-def generate_sample_questions_llm(celebrity, difficulty):
-    params = select_difficulty_params(difficulty)
+def generate_generic_questions(prev_used=set()):
     prompt = (
-        f'Give a JSON array of exactly 3 short, helpful questions a fan might ask to identify the celebrity without revealing the name. '
-        f'Celebrity is "{celebrity}". Hint density should be {params["hint_density"]}. Style mystery is {params["style_mystery"]}. '
-        f'Output format: ["Q1","Q2","Q3"].'
+        "Return a JSON array of exactly 3 short generic questions a fan could ask any film celebrity to identify them without revealing the name. "
+        "Do not reference specific people, works, dates, places, or awards by name. "
+        "Questions must be distinct from each other and phrased simply. "
+        "Output format: [\"Q1\",\"Q2\",\"Q3\"]."
     )
     try:
-        qs = llm_json(prompt, temperature=0.8)
-        out = [q for q in qs if isinstance(q, str)]
-        return out[:3] if len(out) >= 3 else out
+        qs = llm_json(prompt, temperature=0.9)
+        out = [q for q in qs if isinstance(q, str) and q.strip()]
+        out = [q for q in out if q not in prev_used]
+        if len(out) < 3:
+            bank = [
+                "Are you known more for serious roles or lighter roles",
+                "Have you worked across both television and films",
+                "Have you performed in more than one language",
+                "Do you often collaborate with the same directors",
+                "Have you done voice acting for animated projects",
+                "Do you take on physically demanding roles",
+                "Are you known for a signature style on screen",
+                "Have you tried directing or producing as well",
+                "Do you prefer ensemble casts or solo lead roles"
+            ]
+            random.shuffle(bank)
+            for q in bank:
+                if len(out) >= 3:
+                    break
+                if q not in prev_used and q not in out:
+                    out.append(q)
+        return out[:3]
     except Exception:
         bank = [
-            "Which role made you a household name",
-            "Have you worked with any Oscar winners",
-            "Are you known for action or drama"
+            "Are you known more for serious roles or lighter roles",
+            "Have you worked across both television and films",
+            "Have you performed in more than one language",
+            "Do you often collaborate with the same directors",
+            "Have you done voice acting for animated projects",
+            "Do you take on physically demanding roles"
         ]
-        return random.sample(bank, 3)
+        random.shuffle(bank)
+        return bank[:3]
 
 def generate_congrats_line(celebrity, difficulty):
-    sys = f'You are {celebrity}. The fan guessed correctly. Say a one line congrats in your voice. Do not reveal your name.'
+    sys = f'You are {celebrity}. The fan guessed correctly. Say a one line congrats in your voice and you may confirm your name.'
     r = openai.ChatCompletion.create(
         model=OPENAI_MODEL,
         messages=[{"role": "system", "content": sys},
                   {"role": "user", "content": "Congratulate them in one short line."}],
+        temperature=0.8
+    )
+    return r.choices[0].message.content.strip()
+
+def generate_reveal_line(celebrity):
+    sys = f'You are {celebrity}. The fan is out of guesses. Reveal your name in a natural short line in your voice.'
+    r = openai.ChatCompletion.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": sys}],
         temperature=0.8
     )
     return r.choices[0].message.content.strip()
@@ -182,25 +206,103 @@ def fetch_wikipedia_thumb(name):
         resp = requests.get(url, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
-            if "thumbnail" in data and "source" in data["thumbnail"]:
+            if "thumbnail" in data and data["thumbnail"].get("source"):
                 return data["thumbnail"]["source"]
+            if "originalimage" in data and data["originalimage"].get("source"):
+                return data["originalimage"]["source"]
     except Exception:
         pass
-    return None
+    return "https://upload.wikimedia.org/wikipedia/commons/6/65/No-Image-Placeholder.svg"
 
-def style_leaderboard_df(df):
-    base = df[["player","score"]].rename(columns={"player":"Player","score":"Score"}).copy()
-    base = base.sort_values("Score", ascending=False, kind="mergesort").reset_index(drop=True)
-    def color_rows(row):
-        i = row.name
-        if i == 0:
-            return ["background-color: #FFD700"]*len(row)
-        if i == 1:
-            return ["background-color: #C0C0C0"]*len(row)
-        if i == 2:
-            return ["background-color: #CD7F32"]*len(row)
-        return [""]*len(row)
-    return base.style.apply(color_rows, axis=1).hide(axis="index")
+def supabase_realtime_leaderboard_widget():
+    url = st.secrets["SUPABASE_URL"]
+    anon = st.secrets["SUPABASE_ANON"]
+    html = f"""
+    <html>
+    <head>
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+    <style>
+      body {{ margin:0; font-family:system-ui, Arial; }}
+      .wrap {{ padding:8px }}
+      table {{ width:100%; border-collapse:collapse; font-size:14px }}
+      th, td {{ text-align:left; padding:8px }}
+      th {{ border-bottom:1px solid #e5e7eb }}
+      tr:nth-child(even) {{ background:#fafafa }}
+      tr.gold td {{ background:#FFD700 !important }}
+      tr.silver td {{ background:#C0C0C0 !important }}
+      tr.bronze td {{ background:#CD7F32 !important }}
+      .title {{ font-weight:600; margin-bottom:6px }}
+    </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <div class="title">🏆 Leaderboard</div>
+        <table id="lb">
+          <thead><tr><th>Player</th><th>Score</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <script>
+        const client = supabase.createClient("{url}", "{anon}");
+        async function load() {{
+          const {{ data, error }} = await client.from('leaderboard').select('player,score').order('score', {{ ascending: false }}).limit(100);
+          if (error) return;
+          render(data || []);
+        }}
+        function render(rows) {{
+          const tbody = document.querySelector('#lb tbody');
+          tbody.innerHTML = '';
+          rows.sort((a,b) => b.score - a.score);
+          rows.forEach((r,i) => {{
+            const tr = document.createElement('tr');
+            if (i===0) tr.className = 'gold';
+            else if (i===1) tr.className = 'silver';
+            else if (i===2) tr.className = 'bronze';
+            tr.innerHTML = `<td>${{r.player}}</td><td>${{r.score}}</td>`;
+            tbody.appendChild(tr);
+          }});
+        }}
+        load();
+        client.channel('lb-changes').on('postgres_changes', {{ event: '*', schema: 'public', table: 'leaderboard' }}, payload => load()).subscribe();
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=420, scrolling=False)
+
+def supabase_realtime_player_score_widget(player_name):
+    url = st.secrets["SUPABASE_URL"]
+    anon = st.secrets["SUPABASE_ANON"]
+    html = f"""
+    <html>
+    <head>
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+    <style>
+      body {{ margin:0; font-family:system-ui, Arial; }}
+      .wrap {{ text-align:right; padding:6px 0 }}
+      .label {{ color:#6b7280; margin-right:10px }}
+      .val {{ font-weight:700 }}
+    </style>
+    </head>
+    <body>
+      <div class="wrap"><span class="label">Score:</span><span id="score" class="val">0</span></div>
+      <script>
+        const client = supabase.createClient("{url}", "{anon}");
+        const player = {json.dumps(player_name)};
+        async function load() {{
+          const {{ data, error }} = await client.from('leaderboard').select('score').eq('player', player).limit(1).maybeSingle();
+          if (error) return;
+          document.querySelector('#score').textContent = data && data.score != null ? data.score : 0;
+        }}
+        load();
+        client.channel('me-changes')
+          .on('postgres_changes', {{ event: '*', schema: 'public', table: 'leaderboard', filter: `player=eq.${{player}}` }}, payload => load())
+          .subscribe();
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=32, scrolling=False)
 
 if "player_name" not in st.session_state:
     st.session_state.player_name = None
@@ -216,12 +318,10 @@ if "difficulty" not in st.session_state:
     st.session_state.difficulty = "Medium"
 if "guess_counts" not in st.session_state:
     st.session_state.guess_counts = [0]*6
-if "sample_q" not in st.session_state:
-    st.session_state.sample_q = {}
 if "player_photo" not in st.session_state:
     st.session_state.player_photo = None
-
-st_autorefresh(interval=4000, key="lb_tick")
+if "used_generic_qs" not in st.session_state:
+    st.session_state.used_generic_qs = set()
 
 st.title("🎭 Guess the Celebrity")
 
@@ -245,21 +345,13 @@ if st.session_state.player_name is None:
 else:
     left, right = st.columns([1.15, 3.0])
     with left:
-        df_lb = fetch_leaderboard()
-        if not df_lb.empty:
-            styled = style_leaderboard_df(df_lb)
-            st.subheader("🏆 Leaderboard")
-            st.table(styled)
-        else:
-            st.info("No scores yet")
+        supabase_realtime_leaderboard_widget()
     with right:
         topc1, topc2 = st.columns([2,1])
         with topc1:
             st.markdown(f"**Player:** {st.session_state.player_name}")
         with topc2:
-            live_score = get_player_score_from_db(st.session_state.player_name)
-            st.session_state.all_scores[st.session_state.player_name] = live_score
-            st.markdown(f"**Score:** {live_score}")
+            supabase_realtime_player_score_widget(st.session_state.player_name)
         tabs = st.tabs([f"Round {i+1}" for i in range(6)])
         for i in range(6):
             with tabs[i]:
@@ -278,20 +370,25 @@ else:
                                 st.session_state[key_intro] = "(Intro unavailable)"
                         time.sleep(0.2)
                     st.info(st.session_state[key_intro])
-                    if f"qset_{i}" not in st.session_state.sample_q:
-                        st.session_state.sample_q[f"qset_{i}"] = generate_sample_questions_llm(celeb, st.session_state.difficulty)
-                    qs = st.session_state.sample_q[f"qset_{i}"]
+
+                    if f"qset_{i}" not in st.session_state:
+                        st.session_state[f"qset_{i}"] = generate_generic_questions(st.session_state.used_generic_qs)
+                    qs = st.session_state[f"qset_{i}"]
                     qc1, qc2, qc3 = st.columns(3)
                     if qs:
                         if qc1.button(qs[0], key=f"qbtn1_{i}"):
                             st.session_state[f"prompt_{i}"] = qs[0]
-                            st.session_state.sample_q[f"qset_{i}"] = generate_sample_questions_llm(celeb, st.session_state.difficulty)
+                            st.session_state.used_generic_qs.update(qs)
+                            st.session_state[f"qset_{i}"] = generate_generic_questions(st.session_state.used_generic_qs)
                         if qc2.button(qs[1], key=f"qbtn2_{i}"):
                             st.session_state[f"prompt_{i}"] = qs[1]
-                            st.session_state.sample_q[f"qset_{i}"] = generate_sample_questions_llm(celeb, st.session_state.difficulty)
+                            st.session_state.used_generic_qs.update(qs)
+                            st.session_state[f"qset_{i}"] = generate_generic_questions(st.session_state.used_generic_qs)
                         if qc3.button(qs[2], key=f"qbtn3_{i}"):
                             st.session_state[f"prompt_{i}"] = qs[2]
-                            st.session_state.sample_q[f"qset_{i}"] = generate_sample_questions_llm(celeb, st.session_state.difficulty)
+                            st.session_state.used_generic_qs.update(qs)
+                            st.session_state[f"qset_{i}"] = generate_generic_questions(st.session_state.used_generic_qs)
+
                     user_prompt = st.text_area("Your message", key=f"prompt_{i}")
                     ask_clicked = st.button("Ask", key=f"ask_{i}")
                     if ask_clicked and user_prompt:
@@ -301,12 +398,15 @@ else:
                                 st.success("Celebrity says")
                                 st.markdown(reply)
                                 st.toast("New message", icon="💬")
-                                st.session_state.sample_q[f"qset_{i}"] = generate_sample_questions_llm(celeb, st.session_state.difficulty)
+                                st.session_state.used_generic_qs.update(qs)
+                                st.session_state[f"qset_{i}"] = generate_generic_questions(st.session_state.used_generic_qs)
                             except Exception as e:
                                 st.error(f"Error: {e}")
+
                     st.markdown(f"Guesses used: {st.session_state.guess_counts[i]} of 3")
                     if st.session_state.guess_counts[i] >= 3:
-                        st.error("No more guesses for this round")
+                        line = generate_reveal_line(celeb)
+                        st.error(line)
                     else:
                         guess = st.text_input("Your guess", key=f"guess_{i}")
                         if st.button("Submit Guess", key=f"guess_btn_{i}") and guess:
@@ -316,14 +416,13 @@ else:
                                     st.success(f"Correct. It was {celeb}")
                                     st.session_state.guessed[i] = True
                                     pts = select_difficulty_params(st.session_state.difficulty)["points"]
-                                    new_score = st.session_state.all_scores.get(st.session_state.player_name, 0) + pts
-                                    st.session_state.all_scores[st.session_state.player_name] = new_score
+                                    new_score = get_player_score_from_db(st.session_state.player_name) + pts
                                     upsert_score(st.session_state.player_name, new_score)
-                                    fetch_leaderboard.clear()
                                     st.toast(f"+{pts} points", icon="✨")
                                 else:
                                     if st.session_state.guess_counts[i] >= 3:
-                                        st.error("No more guesses for this round")
+                                        line = generate_reveal_line(celeb)
+                                        st.error(line)
                                     else:
                                         st.error("Not quite. Try again")
                 else:
@@ -343,13 +442,14 @@ else:
                         line = generate_congrats_line(celeb, st.session_state.difficulty)
                         st.markdown(f"**{line}**")
                     except Exception:
-                        st.markdown("**Well done**")
+                        st.markdown(f"**Well done. I am {celeb}.**")
+
         if all(st.session_state.guessed):
             st.balloons()
-            st.subheader("You have guessed all celebrities")
             live_score = get_player_score_from_db(st.session_state.player_name)
+            st.subheader("You have guessed all celebrities")
             st.write(f'Final Score: {live_score} of 6 rounds')
             if st.button("Play Again"):
-                for key in ['player_name','selected_industries','celebrity_rounds','guessed','difficulty','guess_counts','sample_q','player_photo']:
+                for key in ['player_name','selected_industries','celebrity_rounds','guessed','difficulty','guess_counts','player_photo','used_generic_qs']:
                     st.session_state.pop(key, None)
                 st.rerun()
