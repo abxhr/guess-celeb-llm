@@ -2,3 +2,4 @@ openai==0.28.0
 streamlit
 requests
 supabase>=2.6.0
+streamlit-autorefresh
