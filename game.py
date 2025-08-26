@@ -19,11 +19,9 @@ import random
 import os
 import time
 import json
-from collections import defaultdict
 from supabase import create_client
 from datetime import datetime
 import pandas as pd
-from io import BytesIO
 
 st.set_page_config(page_title="🎭 Guess the Celebrity", layout="wide")
 st.markdown("""
@@ -88,23 +86,6 @@ def fetch_leaderboard_df():
         return df
     except Exception:
         return pd.DataFrame(columns=["player","score"])
-
-def style_leaderboard_df(df):
-    df = df[["player","score"]].rename(columns={"player":"Player","score":"Score"}).copy()
-    df = df.sort_values("Score", ascending=False, kind="mergesort").reset_index(drop=True)
-    def color_rows(row):
-        i = row.name
-        if i == 0:
-            return ["background-color: #FFD700"]*len(row)
-        if i == 1:
-            return ["background-color: #C0C0C0"]*len(row)
-        if i == 2:
-            return ["background-color: #CD7F32"]*len(row)
-        return [""]*len(row)
-    try:
-        return df.style.apply(color_rows, axis=1).hide(axis="index")
-    except Exception:
-        return df
 
 def supabase_realtime_leaderboard_widget():
     try:
@@ -227,10 +208,10 @@ def llm_json(prompt, temperature=0.6):
 
 def select_difficulty_params(level):
     if level == "Easy":
-        return {"obscurity_min": 0, "obscurity_max": 3, "hint_density": "high", "style_mystery": "low", "points": 1}
+        return {"obscurity_min": 0, "obscurity_max": 3, "points": 1}
     if level == "Medium":
-        return {"obscurity_min": 3, "obscurity_max": 6, "hint_density": "medium", "style_mystery": "medium", "points": 3}
-    return {"obscurity_min": 6, "obscurity_max": 9, "hint_density": "low", "style_mystery": "medium", "points": 5}
+        return {"obscurity_min": 3, "obscurity_max": 6, "points": 3}
+    return {"obscurity_min": 6, "obscurity_max": 9, "points": 5}
 
 def generate_random_celebrities(selected_industries, difficulty):
     try:
@@ -253,18 +234,9 @@ def generate_random_celebrities(selected_industries, difficulty):
     random.shuffle(fallbacks)
     return fallbacks[:6]
 
-def build_style_tag(celebrity, difficulty):
-    params = select_difficulty_params(difficulty)
-    return json.dumps({"celebrity": celebrity, "hint_density": params["hint_density"], "style_mystery": params["style_mystery"]})
-
-def generate_intro(celebrity, difficulty):
+def generate_intro(celebrity):
     try:
-        style = build_style_tag(celebrity, difficulty)
-        sys = (
-            f'You are {celebrity}. Do not state your name. Speak as you normally would. '
-            f'Use real works, roles, co stars, awards, or signature traits as subtle hints. '
-            f'Keep it 2 to 4 sentences. Adjust hint density and mystery according to this JSON: {style}.'
-        )
+        sys = f'You are {celebrity}. Do not state your name. Speak naturally for 2 to 4 sentences and give subtle hints without names.'
         r = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys},
@@ -275,14 +247,9 @@ def generate_intro(celebrity, difficulty):
     except Exception:
         return "(Intro unavailable)"
 
-def generate_response(celebrity, user_prompt, difficulty):
+def generate_response(celebrity, user_prompt):
     try:
-        style = build_style_tag(celebrity, difficulty)
-        sys = (
-            f'You are {celebrity}. Stay fully in character. Be clear, friendly, and natural. '
-            f'Reference true works and collaborators. Never reveal or spell your name or initials unless asked to reveal after guesses are over. '
-            f'Answer the user prompt and optionally offer a subtle hint. Adjust hint density and mystery according to: {style}.'
-        )
+        sys = f'You are {celebrity}. Stay in character. Be clear and friendly. Do not reveal your name.'
         r = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys},
@@ -296,24 +263,23 @@ def generate_response(celebrity, user_prompt, difficulty):
 def generate_generic_questions(prev_used):
     prompt = (
         "Return a JSON array of exactly 5 short generic questions a fan could ask any film celebrity to identify them without revealing the name. "
-        "Do not reference specific people, works, dates, places, or awards by name. "
-        "Keep them distinct and simple. Output format: [\"Q1\",\"Q2\",\"Q3\",\"Q4\",\"Q5\"]."
+        "Do not reference specific people or works by name. Output format: [\"Q1\",\"Q2\",\"Q3\",\"Q4\",\"Q5\"]."
     )
     qs = llm_json(prompt, temperature=0.9)
     qs = [q for q in qs if isinstance(q, str) and q.strip()]
-    bank = [
+    fallback = [
         "Are you known more for serious roles or lighter roles",
-        "Have you worked across both television and films",
+        "Have you worked in both television and films",
         "Have you performed in more than one language",
         "Do you often collaborate with the same directors",
-        "Have you done voice acting for animated projects",
+        "Have you done voice acting for animation",
         "Do you take on physically demanding roles",
-        "Are you known for a signature style on screen",
-        "Have you tried directing or producing as well",
+        "Are you known for a signature on screen style",
+        "Have you tried directing or producing",
         "Do you prefer ensemble casts or solo lead roles"
     ]
-    random.shuffle(bank)
-    for q in bank:
+    random.shuffle(fallback)
+    for q in fallback:
         if len(qs) >= 7:
             break
         if q not in qs:
@@ -325,40 +291,22 @@ def generate_generic_questions(prev_used):
             out.append(q)
         if len(out) == 3:
             break
-    if len(out) < 3:
-        for q in bank:
-            if q not in prev_used and q not in out:
-                out.append(q)
-            if len(out) == 3:
-                break
     while len(out) < 3:
         out.append(f"Do you enjoy roles that challenge you creatively {len(out)+1}")
     return out[:3]
 
-def generate_congrats_line(celebrity, difficulty):
+def generate_congrats_line_named(celebrity):
     try:
-        sys = f'You are {celebrity}. The fan guessed correctly. Say a one line congrats in your voice and you may confirm your name.'
+        sys = f'You are {celebrity}. The fan guessed correctly. Say a short one line congrats and you may confirm your name.'
         r = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": "Congratulate them in one short line."}],
+                      {"role": "user", "content": "One line only."}],
             temperature=0.8
         )
         return r.choices[0].message.content.strip()
     except Exception:
         return f"Well done. I am {celebrity}."
-
-def generate_reveal_line(celebrity):
-    try:
-        sys = f'You are {celebrity}. The fan is out of guesses. Reveal your name in a natural short line in your voice.'
-        r = openai.ChatCompletion.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": sys}],
-            temperature=0.8
-        )
-        return r.choices[0].message.content.strip()
-    except Exception:
-        return f"I am {celebrity}."
 
 def check_guess_llm(user_input, actual_name):
     try:
@@ -373,20 +321,6 @@ def check_guess_llm(user_input, actual_name):
     except Exception:
         return False
 
-def fetch_wikipedia_thumb(name):
-    try:
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{name.replace(' ', '%20')}"
-        resp = requests.get(url, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "thumbnail" in data and data["thumbnail"].get("source"):
-                return data["thumbnail"]["source"]
-            if "originalimage" in data and data["originalimage"].get("source"):
-                return data["originalimage"]["source"]
-    except Exception:
-        pass
-    return "https://upload.wikimedia.org/wikipedia/commons/6/65/No-Image-Placeholder.svg"
-
 if "player_name" not in st.session_state:
     st.session_state.player_name = None
 if "selected_industries" not in st.session_state:
@@ -395,14 +329,14 @@ if "celebrity_rounds" not in st.session_state:
     st.session_state.celebrity_rounds = []
 if "guessed" not in st.session_state:
     st.session_state.guessed = [False]*6
+if "locked" not in st.session_state:
+    st.session_state.locked = [False]*6
 if "all_scores" not in st.session_state:
     st.session_state.all_scores = {}
 if "difficulty" not in st.session_state:
     st.session_state.difficulty = "Medium"
 if "guess_counts" not in st.session_state:
     st.session_state.guess_counts = [0]*6
-if "player_photo" not in st.session_state:
-    st.session_state.player_photo = None
 if "used_generic_qs" not in st.session_state:
     st.session_state.used_generic_qs = set()
 
@@ -413,17 +347,11 @@ if st.session_state.player_name is None:
         name = st.text_input("Enter your name")
         industries = st.multiselect("Choose your industries", ["Hollywood", "Bollywood", "Mollywood"])
         difficulty = st.select_slider("Difficulty", options=["Easy","Medium","Hard"], value="Medium")
-        photo = st.file_uploader("Optional: upload your photo for the celebration image", type=["png","jpg","jpeg"])
         start = st.button("Start Game")
         if start and name and industries:
             st.session_state.player_name = name.strip()
             st.session_state.selected_industries = industries
             st.session_state.difficulty = difficulty
-            if photo is not None:
-                try:
-                    st.session_state.player_photo = photo.read()
-                except Exception:
-                    st.session_state.player_photo = None
             st.session_state.celebrity_rounds = generate_random_celebrities(industries, difficulty)
             st.session_state.all_scores[name] = 0
             upsert_score(name, 0)
@@ -439,11 +367,8 @@ else:
                 df_lb = fetch_leaderboard_df()
                 st.subheader("🏆 Leaderboard")
                 if not df_lb.empty:
-                    styled = style_leaderboard_df(df_lb)
-                    try:
-                        st.table(styled)
-                    except Exception:
-                        st.dataframe(df_lb.rename(columns={"player":"Player","score":"Score"}), use_container_width=True, height=420)
+                    df_show = df_lb.rename(columns={"player":"Player","score":"Score"})
+                    st.dataframe(df_show, use_container_width=True, height=420)
                 else:
                     st.info("No scores yet")
         with right:
@@ -455,17 +380,31 @@ else:
                 if not ok_me:
                     live_score = get_player_score_from_db(st.session_state.player_name)
                     st.markdown(f"**Score:** {live_score}")
-            tabs = st.tabs([f"Round {i+1}" for i in range(6)])
-            for i in range(6):
-                with tabs[i]:
-                    if i >= len(st.session_state.celebrity_rounds):
-                        st.warning("Round not available")
-                        continue
-                    celeb = st.session_state.celebrity_rounds[i]
-                    if not st.session_state.guessed[i]:
+
+            all_attempted = all(g or l for g, l in zip(st.session_state.guessed, st.session_state.locked))
+            if all_attempted:
+                st.subheader("Nice game")
+                st.write("All rounds attempted. Watch the leaderboard on the left.")
+            else:
+                tabs = st.tabs([f"Round {i+1}" for i in range(6)])
+                for i in range(6):
+                    with tabs[i]:
+                        if i >= len(st.session_state.celebrity_rounds):
+                            st.warning("Round not available")
+                            continue
+                        celeb = st.session_state.celebrity_rounds[i]
+
+                        if st.session_state.locked[i]:
+                            st.error(f"Better luck next time. It was {celeb}.")
+                            continue
+
+                        if st.session_state.guessed[i]:
+                            st.success(f"Already guessed correctly. It was {celeb}.")
+                            continue
+
                         key_intro = f"intro_{i}"
                         if key_intro not in st.session_state:
-                            st.session_state[key_intro] = generate_intro(celeb, st.session_state.difficulty)
+                            st.session_state[key_intro] = generate_intro(celeb)
                         st.info(st.session_state[key_intro])
 
                         qkey = f"qset_{i}"
@@ -476,6 +415,7 @@ else:
                             qs = []
                         while len(qs) < 3:
                             qs.append(f"Do you enjoy roles that challenge you creatively {len(qs)+1}")
+
                         try:
                             ccols = st.columns(3)
                             for idx in range(3):
@@ -489,7 +429,7 @@ else:
 
                         user_prompt = st.text_area("Your message", key=f"prompt_{i}")
                         if st.button("Ask", key=f"ask_{i}") and user_prompt:
-                            reply = generate_response(celeb, user_prompt, st.session_state.difficulty)
+                            reply = generate_response(celeb, user_prompt)
                             st.success("Celebrity says")
                             st.markdown(reply)
                             st.session_state.used_generic_qs.update(qs)
@@ -497,60 +437,41 @@ else:
 
                         st.markdown(f"Guesses used: {st.session_state.guess_counts[i]} of 3")
                         if st.session_state.guess_counts[i] >= 3:
-                            line = generate_reveal_line(celeb)
-                            st.error(line)
-                        else:
-                            guess = st.text_input("Your guess", key=f"guess_{i}")
-                            if st.button("Submit Guess", key=f"guess_btn_{i}") and guess:
-                                st.session_state.guess_counts[i] += 1
-                                ok = check_guess_llm(guess, celeb)
-                                if ok:
-                                    st.success(f"Correct. It was {celeb}")
-                                    st.session_state.guessed[i] = True
-                                    pts = select_difficulty_params(st.session_state.difficulty)["points"]
-                                    current = get_player_score_from_db(st.session_state.player_name)
-                                    new_score = current + pts
-                                    upsert_score(st.session_state.player_name, new_score)
+                            st.session_state.locked[i] = True
+                            st.error(f"Better luck next time. It was {celeb}.")
+                            continue
+
+                        guess = st.text_input("Your guess", key=f"guess_{i}")
+                        if st.button("Submit Guess", key=f"guess_btn_{i}") and guess:
+                            st.session_state.guess_counts[i] += 1
+                            okg = check_guess_llm(guess, celeb)
+                            if okg:
+                                st.success(f"Correct. It was {celeb}.")
+                                st.session_state.guessed[i] = True
+                                pts = select_difficulty_params(st.session_state.difficulty)["points"]
+                                current = get_player_score_from_db(st.session_state.player_name)
+                                new_score = current + pts
+                                upsert_score(st.session_state.player_name, new_score)
+                                try:
+                                    line = generate_congrats_line_named(celeb)
+                                    st.markdown(f"**{line}**")
+                                except Exception:
+                                    st.markdown(f"**Well done. I am {celeb}.**")
+                            else:
+                                if st.session_state.guess_counts[i] >= 3:
+                                    st.session_state.locked[i] = True
+                                    st.error(f"Better luck next time. It was {celeb}.")
                                 else:
-                                    if st.session_state.guess_counts[i] >= 3:
-                                        line = generate_reveal_line(celeb)
-                                        st.error(line)
-                                    else:
-                                        st.error("Not quite. Try again")
-                    else:
-                        st.success(f"Already guessed correctly: {celeb}")
-                        celeb_img_url = fetch_wikipedia_thumb(celeb)
-                        if st.session_state.player_photo:
-                            user_img_bytes = st.session_state.player_photo
-                        else:
-                            try:
-                                ph = requests.get("https://upload.wikimedia.org/wikipedia/commons/9/99/Sample_User_Icon.png", timeout=6)
-                                user_img_bytes = ph.content if ph.status_code == 200 else None
-                            except Exception:
-                                user_img_bytes = None
-                        c1, c2 = st.columns(2)
-                        try:
-                            if celeb_img_url:
-                                c1.image(celeb_img_url, caption=celeb, use_column_width=True)
-                        except Exception:
-                            pass
-                        try:
-                            if user_img_bytes:
-                                c2.image(BytesIO(user_img_bytes), caption=st.session_state.player_name, use_column_width=True)
-                        except Exception:
-                            pass
-                        try:
-                            line = generate_congrats_line(celeb, st.session_state.difficulty)
-                            st.markdown(f"**{line}**")
-                        except Exception:
-                            st.markdown(f"**Well done. I am {celeb}.**")
-            if all(st.session_state.guessed):
+                                    st.error("Not quite. Try again")
+
+            all_attempted = all(g or l for g, l in zip(st.session_state.guessed, st.session_state.locked))
+            if all_attempted:
                 st.balloons()
                 live_score = get_player_score_from_db(st.session_state.player_name)
-                st.subheader("You have guessed all celebrities")
+                st.subheader("You have attempted all rounds")
                 st.write(f"Final Score: {live_score} of 6 rounds")
                 if st.button("Play Again"):
-                    for key in ['player_name','selected_industries','celebrity_rounds','guessed','difficulty','guess_counts','player_photo','used_generic_qs']:
+                    for key in ['player_name','selected_industries','celebrity_rounds','guessed','locked','difficulty','guess_counts','used_generic_qs']:
                         st.session_state.pop(key, None)
                     st.rerun()
     except Exception:
