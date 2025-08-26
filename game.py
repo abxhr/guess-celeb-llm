@@ -50,14 +50,33 @@ def safe_create_client():
 def get_supabase():
     return safe_create_client()
 
-def upsert_score(player, score):
+def upsert_score(player, points_to_add):
     try:
         sb = get_supabase()
         if not sb:
             return
-        sb.table("leaderboard").upsert({"player": player, "score": int(score), "updated_at": datetime.utcnow().isoformat()}).execute()
+
+        # fetch current score case-insensitive
+        data = sb.table("leaderboard").select("score,player")\
+                   .ilike("player", player).limit(1).execute().data
+
+        if data:
+            current_score = int(data[0].get("score", 0))
+            db_name = data[0].get("player")  # keep the stored name spelling
+            new_score = current_score + int(points_to_add)
+            sb.table("leaderboard").update(
+                {"score": new_score, "updated_at": datetime.utcnow().isoformat()}
+            ).ilike("player", player).execute()
+        else:
+            # new player, insert fresh
+            sb.table("leaderboard").insert({
+                "player": player,
+                "score": int(points_to_add),
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
     except Exception:
         pass
+
 
 def get_player_score_from_db(player):
     try:
@@ -476,3 +495,4 @@ else:
                     st.rerun()
     except Exception:
         st.error("Unexpected error. Try again.")
+
